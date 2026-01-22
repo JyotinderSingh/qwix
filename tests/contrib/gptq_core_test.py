@@ -92,6 +92,26 @@ class GptqCoreTest(parameterized.TestCase):
     self.assertEqual(w3.shape, (2, 3, 4))
     self.assertTrue(jnp.all(w == w3))
 
+  def test_qarray_identity_reshape_with_non_divisible_scale(self):
+    """Test that QArray identity reshape works when scale doesn't evenly divide qvalue."""
+    # Create a QArray where scale dimension doesn't evenly divide qvalue dimension
+    # This simulates what happens after GPTQ quantization with subchannel quantization
+    # when the number of columns isn't evenly divisible by groupsize
+    qvalue = jnp.ones((256, 3525), dtype=jnp.int8)
+    # 14 scale groups for 3525 columns: 3525 % 14 = 251 != 0
+    scale = jnp.ones((256, 14), dtype=jnp.float32)
+
+    q = qarray.QArray(qvalue, scale)
+
+    # Identity reshape should work even when scale doesn't evenly divide
+    # This tests the fix for the ValueError:
+    # "Cannot reshape (256, 3525) into (256, 3525) for (256, 14)."
+    q_reshaped = q.reshape((256, 3525))
+    self.assertEqual(q_reshaped.shape, (256, 3525))
+    # For identity reshape, the result should be the same object or equivalent
+    self.assertTrue(jnp.array_equal(q_reshaped.qvalue, q.qvalue))
+    self.assertTrue(jnp.array_equal(q_reshaped.scale, q.scale))
+
 
 if __name__ == "__main__":
   absltest.main()
