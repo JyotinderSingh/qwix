@@ -92,25 +92,30 @@ class GptqCoreTest(parameterized.TestCase):
     self.assertEqual(w3.shape, (2, 3, 4))
     self.assertTrue(jnp.all(w == w3))
 
-  def test_qarray_identity_reshape_with_non_divisible_scale(self):
-    """Test that QArray identity reshape works when scale doesn't evenly divide qvalue."""
-    # Create a QArray where scale dimension doesn't evenly divide qvalue dimension
-    # This simulates what happens after GPTQ quantization with subchannel quantization
-    # when the number of columns isn't evenly divisible by groupsize
-    qvalue = jnp.ones((256, 3525), dtype=jnp.int8)
-    # 14 scale groups for 3525 columns: 3525 % 14 = 251 != 0
-    scale = jnp.ones((256, 14), dtype=jnp.float32)
+  def test_gptq_no_subchannel_with_non_divisible_columns(self):
+    """Test GPTQ produces valid QArray when columns isn't divisible by rows."""
+    # Shape where columns (3525) is not divisible by rows (256)
+    # Previously this would create scale.shape=(256, 14) which violates QArray contract
+    # since 3525 % 14 != 0
+    w = jax.nn.initializers.lecun_normal()(
+        jax.random.key(0), (256, 3525), jnp.float32
+    )
+    x = jax.random.t(jax.random.key(1), 5, (3525, 1024), jnp.float32)
 
-    q = qarray.QArray(qvalue, scale)
+    # No subchannel quantization specified (no tiled_axes)
+    how = qarray.HowToQuantize(
+        qtype=jnp.int8,
+        channelwise_axes=[0],
+    )
 
-    # Identity reshape should work even when scale doesn't evenly divide
-    # This tests the fix for the ValueError:
-    # "Cannot reshape (256, 3525) into (256, 3525) for (256, 14)."
-    q_reshaped = q.reshape((256, 3525))
-    self.assertEqual(q_reshaped.shape, (256, 3525))
-    # For identity reshape, the result should be the same object or equivalent
-    self.assertTrue(jnp.array_equal(q_reshaped.qvalue, q.qvalue))
-    self.assertTrue(jnp.array_equal(q_reshaped.scale, q.scale))
+    h = gptq_core.compute_hessian(x)
+    w_gptq, _ = gptq_core.quantize_weight(w, h, how)
+
+    # Verify the QArray is valid:
+    # - qvalue.shape should match original weight shape
+    # - scale.shape should be (rows, 1) for per-tensor on axis 1
+    self.assertEqual(w_gptq.qvalue.shape, (256, 3525))
+    self.assertEqual(w_gptq.scale.shape, (256, 1))
 
 
 if __name__ == "__main__":

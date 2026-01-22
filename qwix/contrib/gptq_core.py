@@ -102,7 +102,7 @@ def quantize_weight(
   rows, columns = W.shape
   assert H.shape == (columns, columns)
 
-  groupsize = how.tiled_axes.get(1, rows)
+  groupsize = how.tiled_axes.get(1, columns)
 
   H_diag = jnp.diag(H)
   dead = H_diag == 0

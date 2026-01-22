@@ -106,13 +106,6 @@ def reshape(array: QArray, *new_shape) -> QArray:
     except TypeError:
       pass
 
-  # Fast path: identity reshape returns unchanged.
-  # This avoids running the grouping logic which can fail when scale dimensions
-  # don't evenly divide qvalue dimensions (e.g., after GPTQ quantization with
-  # subchannel quantization where columns isn't divisible by groupsize).
-  if array.shape == new_shape:
-    return array
-
   prod = lambda s: functools.reduce(lambda x, y: x * y, s, 1)
 
   old_shape = array.shape
