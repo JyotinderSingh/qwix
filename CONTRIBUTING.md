@@ -97,6 +97,30 @@ Once the setup is complete, you can build and view the documentation.
     docs/build/html` Open your web browser to `http://localhost:8000` to view
     the documentation.
 
+## Code Formatting
+
+This project uses [ruff](https://docs.astral.sh/ruff/) for linting and
+formatting. All contributions must pass ruff checks before being merged.
+
+Ruff is included in the `dev` dependencies and will be installed automatically
+when you run `pip install -e ".[dev]"`.
+
+### Format Your Code
+
+```bash
+# Format all files
+ruff format .
+
+# Check for lint errors
+ruff check .
+
+# Auto-fix lint errors where possible
+ruff check --fix .
+```
+
+Please run `ruff format .` and `ruff check .` before submitting your PR. These
+checks also run automatically in CI on every push and pull request.
+
 ## Before you submit your PR
 
 ### Sign our Contributor License Agreement
