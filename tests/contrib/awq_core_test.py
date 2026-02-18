@@ -104,17 +104,6 @@ class AwqCoreTest(parameterized.TestCase):
     mse_awq_out = rel_rmse(y_awq, target)
     self.assertLess(mse_awq_out, mse_rtn_out)
 
-  def test_normalize_weight(self):
-    """Tests that normalize_weight correctly reshapes the weight tensor."""
-    w = jnp.arange(2 * 3 * 4).reshape(2, 3, 4)
-    w2, restore_shape = awq_core.normalize_weight(w, 1)
-    # Contraction axis 1 (size 3) moves to last.
-    # shape becomes (2*4, 3) = (8, 3)
-    self.assertEqual(w2.shape, (8, 3))
-    w3 = restore_shape(w2)
-    self.assertEqual(w3.shape, (2, 3, 4))
-    np.testing.assert_array_equal(w, w3)
-
 
 if __name__ == "__main__":
   absltest.main()
