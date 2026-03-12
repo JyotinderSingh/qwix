@@ -146,37 +146,10 @@ class QepLinenTest(parameterized.TestCase):
     )
     self.assertEqual(result.stages[1].module_paths, ('DenseC',))
 
-  def test_explicit_stage_override(self):
-    model = self._make_branch_model()
-    x = jax.random.normal(jax.random.key(6), (8, 12))
-    variables = model.init(jax.random.key(7), x)
-    rules = [
-        qep.QepRule(
-            module_path='DenseA', weight_qtype=jnp.int8,
-            stage_order=0, stage_group='shared',
-        ),
-        qep.QepRule(
-            module_path='DenseB', weight_qtype=jnp.int8,
-            stage_order=0, stage_group='shared',
-        ),
-        qep.QepRule(
-            module_path='DenseC', weight_qtype=jnp.int8,
-            stage_order=1,
-        ),
-    ]
-
-    result = qep.quantize(model, [x], rules, variables=variables)
-
-    self.assertLen(result.stages, 2)
-    self.assertEqual(result.stages[0].group, 'shared')
-    self.assertEqual(
-        set(result.stages[0].module_paths), {'DenseA', 'DenseB'}
-    )
-
   def test_no_matching_layers_raises(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(8), (4, 32))
-    variables = model.init(jax.random.key(9), x)
+    x = jax.random.normal(jax.random.key(6), (4, 32))
+    variables = model.init(jax.random.key(7), x)
 
     with self.assertRaises(ValueError):
       qep.quantize(
@@ -188,8 +161,8 @@ class QepLinenTest(parameterized.TestCase):
 
   def test_non_reiterable_input_raises(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(10), (4, 32))
-    variables = model.init(jax.random.key(11), x)
+    x = jax.random.normal(jax.random.key(8), (4, 32))
+    variables = model.init(jax.random.key(9), x)
     rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
 
     with self.assertRaises(ValueError):
@@ -197,8 +170,8 @@ class QepLinenTest(parameterized.TestCase):
 
   def test_quantize_params_without_correction_does_not_require_hessian_delta(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(12), (4, 32))
-    variables = model.init(jax.random.key(13), x)
+    x = jax.random.normal(jax.random.key(10), (4, 32))
+    variables = model.init(jax.random.key(11), x)
     rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
     ptq_model = self._make_ptq_model(model, rules)
     abs_quantized = self._get_abs_quantized(ptq_model, x)

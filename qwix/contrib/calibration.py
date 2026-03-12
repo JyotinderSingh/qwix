@@ -47,7 +47,16 @@ class CalibrationProvider(
     """Returns the suffix for the stats variable name (e.g., '_gptq')."""
 
   @abc.abstractmethod
-  def _collect_stats(self, lhs: jax.Array, weight_name: str) -> None:
+  def _collect_stats(
+      self,
+      lhs: jax.Array,
+      weight_name: str,
+      *,
+      module_path: tuple[str, ...],
+      op_name: str,
+      op_id: str | None,
+      lhs_id: int,
+  ) -> None:
     """Collects statistics from the reshaped input activations.
 
     Called after all validation passes. The LHS has already been reshaped
@@ -56,6 +65,10 @@ class CalibrationProvider(
     Args:
       lhs: Input activations reshaped to (ca, rest) format.
       weight_name: The name of the weight parameter for this operation.
+      module_path: The current module path for this operation.
+      op_name: The intercepted operation name.
+      op_id: The operation identifier assigned by the quantization tracer.
+      lhs_id: Python object id of the original lhs before reshaping.
     """
 
   def dot_general(
@@ -65,11 +78,12 @@ class CalibrationProvider(
       dimension_numbers: jax.lax.DotDimensionNumbers,
       *args,
       rule: qconfig.QuantizationRule | None = None,
+      op_id: str | None = None,
       **kwargs,
   ) -> jax.Array:
     res = jax.lax.dot_general(lhs, rhs, dimension_numbers, *args, **kwargs)
-    if rule is None:
-      rule, _ = self._get_current_rule_and_op_id('dot_general')
+    if rule is None or op_id is None:
+      rule, op_id = self._get_current_rule_and_op_id('dot_general')
 
     rule_type = self.get_rule_type()
     if not isinstance(rule, rule_type):
@@ -86,16 +100,24 @@ class CalibrationProvider(
       # If we cannot identify the weight parameter, we skip calibration.
       return res
 
+    lhs_id = id(lhs)
     # Reorder lhs to (ca, rest) format.
     lhs = jnp.moveaxis(lhs, lhs_ca[0], 0)
     lhs = lhs.reshape(lhs.shape[0], -1)
 
-    self._collect_stats(lhs, weight_name)
+    self._collect_stats(
+        lhs,
+        weight_name,
+        module_path=tuple(map(str, flax_util.get_current_module_path())),
+        op_name='dot_general',
+        op_id=op_id,
+        lhs_id=lhs_id,
+    )
 
     return res
 
   def einsum(self, einsum_str, *operands, **kwargs):
-    rule, _ = self._get_current_rule_and_op_id('einsum')
+    rule, op_id = self._get_current_rule_and_op_id('einsum')
     rule_type = self.get_rule_type()
     if not isinstance(rule, rule_type):
       return jnp.einsum(einsum_str, *operands, **kwargs)
@@ -105,7 +127,7 @@ class CalibrationProvider(
 
     def stats_dot_general(lhs, rhs, dimension_numbers, *args, **kwargs):
       return self.dot_general(
-          lhs, rhs, dimension_numbers, *args, rule=rule, **kwargs
+          lhs, rhs, dimension_numbers, *args, rule=rule, op_id=op_id, **kwargs
       )
 
     with jax.disable_jit():
@@ -135,7 +157,17 @@ class SinglePassCalibrationProvider(CalibrationProvider, metaclass=abc.ABCMeta):
   def compute_stats(self, lhs: jax.Array) -> dict[str, Any]:
     """Computes statistics from the input array."""
 
-  def _collect_stats(self, lhs: jax.Array, weight_name: str) -> None:
+  def _collect_stats(
+      self,
+      lhs: jax.Array,
+      weight_name: str,
+      *,
+      module_path: tuple[str, ...],
+      op_name: str,
+      op_id: str | None,
+      lhs_id: int,
+  ) -> None:
+    del module_path, op_name, op_id, lhs_id
     stats = self.compute_stats(lhs)
     aggregator = averaging.SimpleMovingAverage()
     var_name = weight_name + self.get_stats_suffix()
