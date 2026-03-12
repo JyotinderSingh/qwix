@@ -16,14 +16,15 @@
 from absl.testing import absltest
 from absl.testing import parameterized
 import flax.linen as nn
+from flax import nnx
 import jax
 import jax.numpy as jnp
+from qwix._src import averaging
 from qwix._src import model as qwix_model
 from qwix._src.core import qarray
 from qwix._src.providers import ptq
 from qwix.contrib import calibration
 from qwix.contrib import gptq
-from qwix.contrib import qep
 
 
 class NormalizeWeightTest(parameterized.TestCase):
@@ -188,213 +189,62 @@ class QuantizeParamsWithCalibrationTest(parameterized.TestCase):
     y_direct = ptq_model.apply({'params': direct_result}, x)
     self.assertTrue(jnp.allclose(y_shared, y_direct))
 
+  def test_selected_paths_without_ptq_fallback_returns_partial_tree(self):
+    rules = [gptq.GptqRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
+    _, _, x, variables, abs_variables = self._setup_model_and_stats(rules)
 
-class TwoPassCalibrationProviderTest(parameterized.TestCase):
-  """Tests for TwoPassCalibrationProvider using QepCalibrationProvider."""
+    def mock_quantize(prepared):
+      w = qarray.quantize(prepared.weight, prepared.how)
+      w = prepared.restore_shape(w)
+      return prepared.abs_w.replace(array=w)
 
-  def _make_setup(self, rules):
-    """Creates a dense model, initializes it, and builds dequantized params."""
-
-    class DenseModel(nn.Module):
-
-      @nn.compact
-      def __call__(self, x):
-        x = nn.Dense(128)(x)
-        x = nn.gelu(x)
-        x = nn.Dense(64)(x)
-        return x
-
-    model = DenseModel()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(variables['params'], abs_variables['params'])
-    deq_params = jax.tree.map(
-        lambda p: (
-            qarray.dequantize(p.array) if isinstance(p, ptq.WithAux) else p
-        ),
-        ptq_params,
-        is_leaf=lambda p: isinstance(p, ptq.WithAux),
-    )
-    return model, x, variables, deq_params
-
-  def test_float_pass_populates_cache(self):
-    """Tests that the float pass fills _float_lhs_cache with activations."""
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    model, x, variables, _ = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    # Manually drive only the float pass.
-    provider._mode = calibration.TwoPassCalibrationProvider._FLOAT_MODE
-    provider._float_lhs_cache.clear()
-    cal_model.apply(variables, x, mutable='quant_stats')
-
-    self.assertNotEmpty(provider._float_lhs_cache)
-
-  def test_mode_is_none_after_calibrate_batch(self):
-    """Tests that _mode is reset to None after calibrate_batch completes."""
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    model, x, variables, deq_params = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-    provider.calibrate_batch(cal_model, variables, {'params': deq_params}, x)
-
-    self.assertIsNone(provider._mode)
-
-  def test_stats_accumulated_across_batches(self):
-    """Tests that repeated calibrate_batch calls accumulate stats correctly."""
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    model, x, variables, deq_params = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    # First batch: count should be 1.
-    new_vars = provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-    cal_variables = {**variables, **new_vars}
-    self.assertEqual(
-        cal_variables['quant_stats']['Dense_0']['kernel_qep']['count'], 1
+    result = calibration.quantize_params_with_calibration(
+        variables['params'],
+        abs_variables['params'],
+        variables['quant_stats'],
+        '_gptq',
+        mock_quantize,
+        selected_paths={('Dense_0', 'kernel')},
+        ptq_fallback=False,
     )
 
-    # Second batch: count should be 2.
-    new_vars = provider.calibrate_batch(
-        cal_model, cal_variables, {**cal_variables, 'params': deq_params}, x
+    self.assertIn('Dense_0', result)
+    self.assertNotIn('Dense_1', result)
+
+  def test_nnx_returns_pure_dict(self):
+    q_rules = [gptq.GptqRule(weight_qtype=jnp.int8)]
+    x = jnp.ones((4, 12))
+    model = nnx.Linear(in_features=12, out_features=6, rngs=nnx.Rngs(0))
+    abs_model = nnx.eval_shape(
+        lambda: qwix_model.quantize_model(model, ptq.PtqProvider(q_rules), x)
     )
-    cal_variables.update(new_vars)
-    self.assertEqual(
-        cal_variables['quant_stats']['Dense_0']['kernel_qep']['count'], 2
-    )
+    orig_params = nnx.to_pure_dict(nnx.state(model, nnx.Param))
+    fake_hessian = jnp.eye(12)
+    aggregator = averaging.SimpleMovingAverage()
+    quant_stats = {
+        'kernel_gptq': aggregator.update(
+            aggregator.init({'hessian': fake_hessian}),
+            {'hessian': fake_hessian},
+        )
+    }
 
-  def test_cache_cleared_between_batches(self):
-    """Tests that _float_lhs_cache is cleared at the start of each batch."""
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    model, x, variables, deq_params = self._make_setup(rules)
+    def mock_quantize(prepared):
+      w = qarray.quantize(prepared.weight, prepared.how)
+      w = prepared.restore_shape(w)
+      return prepared.abs_w.replace(array=w)
 
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    new_vars = provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-
-    # Poison the cache with a stale key between batches.
-    provider._float_lhs_cache['stale/key'] = jnp.zeros((1, 1))
-    self.assertIn('stale/key', provider._float_lhs_cache)
-
-    # Second batch must clear the stale entry before repopulating.
-    cal_variables = {**variables, **new_vars}
-    provider.calibrate_batch(
-        cal_model, cal_variables, {**cal_variables, 'params': deq_params}, x
-    )
-    self.assertNotIn('stale/key', provider._float_lhs_cache)
-
-  def test_collect_stats_without_calibrate_batch_raises(self):
-    """Tests that running the model outside calibrate_batch raises ValueError."""
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    model, x, variables, _ = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    # _mode is None by default; _collect_stats should raise.
-    with self.assertRaises(ValueError):
-      cal_model.apply(variables, x, mutable='quant_stats')
-
-  def test_no_matching_layers_raises(self):
-    """Tests that calibrate_batch raises ValueError when no layers match."""
-    model, x, variables, deq_params = self._make_setup(
-        [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
+    result = calibration.quantize_params_with_calibration(
+        orig_params,
+        abs_model,
+        quant_stats,
+        '_gptq',
+        mock_quantize,
     )
 
-    # Provider whose rule matches nothing in the model.
-    rules = [qep.QepRule(module_path='NonExistent_0', weight_qtype=jnp.int8)]
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    with self.assertRaises(ValueError):
-      provider.calibrate_batch(cal_model, variables, {'params': deq_params}, x)
-
-  def test_cache_keys_distinguish_multiple_layers(self):
-    """Tests that each matching layer gets a separate cache entry."""
-    rules = [qep.QepRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
-    model, x, variables, _ = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-
-    # Run only the float pass to inspect the cache directly.
-    provider._mode = calibration.TwoPassCalibrationProvider._FLOAT_MODE
-    provider._float_lhs_cache.clear()
-    cal_model.apply(variables, x, mutable='quant_stats')
-
-    cache_keys = list(provider._float_lhs_cache.keys())
-    # One entry per Dense layer (Dense_0/kernel and Dense_1/kernel).
-    self.assertLen(cache_keys, 2)
-    # Keys must differ — the module path disambiguates same-named params.
-    self.assertNotEqual(cache_keys[0], cache_keys[1])
-
-  def test_multiple_layers_each_get_stats(self):
-    """Tests that all matching layers accumulate their own quant_stats."""
-    rules = [qep.QepRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
-    model, x, variables, deq_params = self._make_setup(rules)
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-    new_vars = provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-
-    quant_stats = new_vars['quant_stats']
-    self.assertIn('Dense_0', quant_stats)
-    self.assertIn('Dense_1', quant_stats)
-    self.assertIn('kernel_qep', quant_stats['Dense_0'])
-    self.assertIn('kernel_qep', quant_stats['Dense_1'])
-
-  def test_einsum_two_pass_calibration(self):
-    """Tests that two-pass calibration works with einsum-based layers."""
-
-    class EinsumModel(nn.Module):
-
-      @nn.compact
-      def __call__(self, x):
-        x = nn.Einsum(shape=(x.shape[-1], 64), einsum_str='bi,io->bo')(x)
-        return x
-
-    model = EinsumModel()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-
-    rules = [qep.QepRule(module_path='Einsum_0', weight_qtype=jnp.int8)]
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(variables['params'], abs_variables['params'])
-    deq_params = jax.tree.map(
-        lambda p: (
-            qarray.dequantize(p.array) if isinstance(p, ptq.WithAux) else p
-        ),
-        ptq_params,
-        is_leaf=lambda p: isinstance(p, ptq.WithAux),
-    )
-
-    provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, provider)
-    new_vars = provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-
-    qep_stats = new_vars['quant_stats']['Einsum_0']['kernel_qep']
-    self.assertEqual(qep_stats['count'], 1)
-    self.assertIn('sum_of_hessian', qep_stats)
-    self.assertIn('sum_of_hessian_delta', qep_stats)
+    self.assertIsInstance(result, dict)
+    nnx.update(abs_model, result)
+    y = abs_model(x)
+    self.assertEqual(y.shape, (4, 6))
 
 
 if __name__ == '__main__':

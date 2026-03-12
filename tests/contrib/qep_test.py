@@ -17,311 +17,207 @@ from absl.testing import parameterized
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from qwix._src import averaging
 from qwix._src import model as qwix_model
-from qwix._src.core import qarray
 from qwix._src.providers import ptq
 from qwix.contrib import gptq
 from qwix.contrib import qep
+from qwix.contrib import qep_core
 
 
-class QepTest(parameterized.TestCase):
+def _mae(a, b):
+  return jnp.mean(jnp.abs(a - b))
+
+
+class QepLinenTest(parameterized.TestCase):
 
   def _make_dense_model(self):
-    """Creates a simple dense model for testing."""
-
     class DenseModel(nn.Module):
+
       @nn.compact
-      def __call__(self, x):
-        x = nn.Dense(128)(x)
+      def __call__(self, x, return_hidden=False):
+        x = nn.Dense(128, name='Dense_0')(x)
         x = nn.gelu(x)
-        x = nn.Dense(64)(x)
+        hidden = x
+        x = nn.Dense(64, name='Dense_1')(x)
+        if return_hidden:
+          return hidden, x
         return x
 
     return DenseModel()
 
-  def _dequantize_params(self, ptq_params):
-    """Dequantize PTQ params to float with quantization artifacts."""
-    return jax.tree.map(
-        lambda p: (
-            qarray.dequantize(p.array)
-            if isinstance(p, ptq.WithAux)
-            else p
-        ),
-        ptq_params,
-        is_leaf=lambda p: isinstance(p, ptq.WithAux),
-    )
+  def _make_branch_model(self):
+    class BranchModel(nn.Module):
 
-  def test_qep_dense_model_calibration(self):
-    """Tests QEP calibration collects correct stats structure."""
-    model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
+      @nn.compact
+      def __call__(self, x):
+        a = nn.Dense(16, name='DenseA')(x)
+        b = nn.Dense(16, name='DenseB')(x)
+        x = jax.nn.relu(a + b)
+        x = nn.Dense(8, name='DenseC')(x)
+        return x
 
-    # Get dequantized PTQ params to simulate quantized activations.
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
+    return BranchModel()
+
+  def _make_ptq_model(self, model, rules):
     ptq_provider = ptq.PtqProvider(rules)
     ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(
-        variables['params'], abs_variables['params']
+    return ptq_model
+
+  def _get_abs_quantized(self, ptq_model, x):
+    return jax.eval_shape(ptq_model.init, jax.random.key(0), x)['params']
+
+  def _manual_two_stage_reference(self, model, variables, x):
+    stage0_rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
+    stage0_result = qep.quantize(model, [x], stage0_rules, variables=variables)
+    hidden_q, _ = stage0_result.model.apply(
+        {'params': stage0_result.params}, x, return_hidden=True
     )
-    deq_params = self._dequantize_params(ptq_params)
+    hidden_fp, _ = model.apply(variables, x, return_hidden=True)
 
-    # QEP Calibration.
-    qep_provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, qep_provider)
-
-    # First batch.
-    new_vars = qep_provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
+    stage1_rules = [qep.QepRule(module_path='Dense_1', weight_qtype=jnp.int8)]
+    ptq_model = self._make_ptq_model(model, stage1_rules)
+    abs_quantized = self._get_abs_quantized(ptq_model, x)
+    stage1_stats = qep_core.compute_qep_stats(hidden_q.T, hidden_fp.T)
+    aggregator = averaging.SimpleMovingAverage()
+    quant_stat = aggregator.update(aggregator.init(stage1_stats), stage1_stats)
+    stage1_params = qep.quantize_params(
+        variables['params'],
+        abs_quantized,
+        {'Dense_1': {'kernel_qep': quant_stat}},
     )
-    cal_variables = {**variables, **new_vars}
-
-    # Check stats structure.
-    qep_stats = cal_variables['quant_stats']['Dense_0']['kernel_qep']
-    self.assertEqual(qep_stats['count'], 1)
-    self.assertEqual(qep_stats['sum_of_hessian'].shape, (32, 32))
-    self.assertEqual(qep_stats['sum_of_hessian_delta'].shape, (32, 32))
-
-    # Second batch (test accumulation).
-    new_vars = qep_provider.calibrate_batch(
-        cal_model, cal_variables, {**cal_variables, 'params': deq_params}, x
+    stage1_params['Dense_0'] = stage0_result.params['Dense_0']
+    full_ptq_model = self._make_ptq_model(
+        model, [qep.QepRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
     )
-    cal_variables.update(new_vars)
-    qep_stats = cal_variables['quant_stats']['Dense_0']['kernel_qep']
-    self.assertEqual(qep_stats['count'], 2)
+    return full_ptq_model.apply({'params': stage1_params}, x)
 
-  def test_qep_better_than_ptq(self):
-    """Tests that QEP output is closer to float than PTQ."""
+  def test_single_layer_qep_beats_ptq_and_matches_gptq(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
+    x = jax.random.normal(jax.random.key(0), (8, 32))
     variables = model.init(jax.random.key(1), x)
-
-    # Float output for reference.
     fp_y = model.apply(variables, x)
 
     rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(
-        variables['params'], abs_variables['params']
-    )
-    deq_params = self._dequantize_params(ptq_params)
+    result = qep.quantize(model, [x], rules, variables=variables)
+    qep_y = result.model.apply({'params': result.params}, x)
 
-    # QEP calibration.
-    qep_provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, qep_provider)
-    new_vars = qep_provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-    cal_variables = {**variables, **new_vars}
-
-    # Quantize with QEP.
-    qep_params = qep.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        cal_variables['quant_stats'],
-        correction_factor=0.5,
-        damping_factor=1.0,
-    )
-    qep_y = ptq_model.apply({'params': qep_params}, x)
-
-    # PTQ output for comparison.
+    ptq_model = self._make_ptq_model(model, rules)
+    abs_quantized = self._get_abs_quantized(ptq_model, x)
+    ptq_params = ptq.quantize_params(variables['params'], abs_quantized)
     ptq_y = ptq_model.apply({'params': ptq_params}, x)
 
-    # QEP should be better than PTQ in terms of the output error.
-    mae = lambda a, b: jnp.mean(jnp.abs(a - b))
-    self.assertLess(mae(fp_y, qep_y), mae(fp_y, ptq_y))
-
-  def test_qep_vs_gptq_accuracy(self):
-    """Tests that QEP matches or improves upon standard GPTQ accuracy."""
-    model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-
-    # Float output for reference.
-    fp_y = model.apply(variables, x)
-
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(
-        variables['params'], abs_variables['params']
+    gptq_provider = gptq.GptqCalibrationProvider(
+        [gptq.GptqRule(module_path='Dense_0', weight_qtype=jnp.int8)]
     )
-    deq_params = self._dequantize_params(ptq_params)
-
-    # QEP calibration.
-    qep_provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, qep_provider)
-    new_vars = qep_provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
-    )
-    cal_variables = {**variables, **new_vars}
-
-    # Quantize with QEP.
-    qep_params = qep.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        cal_variables['quant_stats'],
-        correction_factor=0.5,
-        damping_factor=1.0,
-    )
-    qep_y = ptq_model.apply({'params': qep_params}, x)
-
-    # Standard GPTQ for comparison.
-    gptq_rules = [gptq.GptqRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    gptq_cal_provider = gptq.GptqCalibrationProvider(gptq_rules)
-    gptq_cal_model = qwix_model.quantize_model(model, gptq_cal_provider)
-    _, gptq_vars = gptq_cal_model.apply(variables, x, mutable='quant_stats')
-    gptq_variables = {**variables, **gptq_vars}
+    gptq_model = qwix_model.quantize_model(model, gptq_provider)
+    _, gptq_vars = gptq_model.apply(variables, x, mutable='quant_stats')
     gptq_params = gptq.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        gptq_variables['quant_stats'],
+        variables['params'], abs_quantized, gptq_vars['quant_stats']
     )
     gptq_y = ptq_model.apply({'params': gptq_params}, x)
 
-    mae = lambda a, b: jnp.mean(jnp.abs(a - b))
-    qep_error = mae(fp_y, qep_y)
-    gptq_error = mae(fp_y, gptq_y)
+    self.assertLess(_mae(fp_y, qep_y), _mae(fp_y, ptq_y))
+    self.assertLessEqual(_mae(fp_y, qep_y), _mae(fp_y, gptq_y) * 1.1)
 
-    # QEP should be at least as good as standard GPTQ (allow small tolerance
-    # since the small test model may not fully exercise QEP's advantages).
-    self.assertLessEqual(qep_error, gptq_error * 1.1)
-
-  def test_qep_all_layers_quantized(self):
-    """Tests QEP accuracy when all layers are quantized."""
+  def test_exact_stagewise_matches_manual_two_stage_reference(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-    fp_y = model.apply(variables, x)
+    x = jax.random.normal(jax.random.key(2), (8, 32))
+    variables = model.init(jax.random.key(3), x)
 
-    # Quantize ALL Dense layers.
     rules = [qep.QepRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-    ptq_params = ptq.quantize_params(
-        variables['params'], abs_variables['params']
+    result = qep.quantize(model, [x], rules, variables=variables)
+    exact_y = result.model.apply({'params': result.params}, x)
+    ref_y = self._manual_two_stage_reference(model, variables, x)
+
+    self.assertLess(_mae(exact_y, ref_y), 1e-6)
+
+  def test_infers_shared_input_branch_stage(self):
+    model = self._make_branch_model()
+    x = jax.random.normal(jax.random.key(4), (8, 12))
+    variables = model.init(jax.random.key(5), x)
+    rules = [qep.QepRule(module_path='.*', weight_qtype=jnp.int8)]
+
+    result = qep.quantize(model, [x], rules, variables=variables)
+
+    self.assertLen(result.stages, 2)
+    self.assertEqual(
+        set(result.stages[0].module_paths), {'DenseA', 'DenseB'}
     )
-    deq_params = self._dequantize_params(ptq_params)
+    self.assertEqual(result.stages[1].module_paths, ('DenseC',))
 
-    # QEP calibration over all layers.
-    qep_provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, qep_provider)
-    new_vars = qep_provider.calibrate_batch(
-        cal_model, variables, {'params': deq_params}, x
+  def test_explicit_stage_override(self):
+    model = self._make_branch_model()
+    x = jax.random.normal(jax.random.key(6), (8, 12))
+    variables = model.init(jax.random.key(7), x)
+    rules = [
+        qep.QepRule(
+            module_path='DenseA', weight_qtype=jnp.int8,
+            stage_order=0, stage_group='shared',
+        ),
+        qep.QepRule(
+            module_path='DenseB', weight_qtype=jnp.int8,
+            stage_order=0, stage_group='shared',
+        ),
+        qep.QepRule(
+            module_path='DenseC', weight_qtype=jnp.int8,
+            stage_order=1,
+        ),
+    ]
+
+    result = qep.quantize(model, [x], rules, variables=variables)
+
+    self.assertLen(result.stages, 2)
+    self.assertEqual(result.stages[0].group, 'shared')
+    self.assertEqual(
+        set(result.stages[0].module_paths), {'DenseA', 'DenseB'}
     )
-    cal_variables = {**variables, **new_vars}
 
-    # Quantize with QEP.
-    qep_params = qep.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        cal_variables['quant_stats'],
-        correction_factor=0.5,
-        damping_factor=1.0,
-    )
-    qep_y = ptq_model.apply({'params': qep_params}, x)
-
-    # PTQ output.
-    ptq_y = ptq_model.apply({'params': ptq_params}, x)
-
-    # Standard GPTQ for comparison.
-    gptq_rules = [gptq.GptqRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
-    gptq_cal_provider = gptq.GptqCalibrationProvider(gptq_rules)
-    gptq_cal_model = qwix_model.quantize_model(model, gptq_cal_provider)
-    _, gptq_vars = gptq_cal_model.apply(variables, x, mutable='quant_stats')
-    gptq_variables = {**variables, **gptq_vars}
-    gptq_params = gptq.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        gptq_variables['quant_stats'],
-    )
-    gptq_y = ptq_model.apply({'params': gptq_params}, x)
-
-    mae = lambda a, b: jnp.mean(jnp.abs(a - b))
-
-    # QEP should be better than PTQ.
-    self.assertLess(mae(fp_y, qep_y), mae(fp_y, ptq_y))
-
-    # GPTQ should also be better than PTQ (baseline sanity check).
-    self.assertLess(mae(fp_y, gptq_y), mae(fp_y, ptq_y))
-
-  def test_qep_no_matching_layers_raises(self):
-    """Tests that calibrate_batch raises when no layers match."""
+  def test_no_matching_layers_raises(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-
-    # Use a module_path that matches nothing.
-    rules = [qep.QepRule(module_path='NonExistent', weight_qtype=jnp.int8)]
-    qep_provider = qep.QepCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, qep_provider)
+    x = jax.random.normal(jax.random.key(8), (4, 32))
+    variables = model.init(jax.random.key(9), x)
 
     with self.assertRaises(ValueError):
-      qep_provider.calibrate_batch(cal_model, variables, variables, x)
-
-  def test_quantize_params_without_hessian_delta_raises(self):
-    """Tests error when QEP stats lack hessian_delta."""
-    model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
-
-    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-
-    # Manually construct stats with '_qep' suffix but no hessian_delta.
-    from qwix._src import averaging
-    fake_hessian = jnp.eye(32)
-    fake_stats = averaging.SimpleMovingAverage().init(
-        {'hessian': fake_hessian}
-    )
-    fake_stats = averaging.SimpleMovingAverage().update(
-        fake_stats, {'hessian': fake_hessian}
-    )
-    quant_stats = {'Dense_0': {'kernel_qep': fake_stats}}
-
-    with self.assertRaises(ValueError):
-      qep.quantize_params(
-          variables['params'],
-          abs_variables['params'],
-          quant_stats,
+      qep.quantize(
+          model,
+          [x],
+          [qep.QepRule(module_path='NonExistent', weight_qtype=jnp.int8)],
+          variables=variables,
       )
 
-  def test_quantize_params_backward_compatible_with_gptq(self):
-    """Tests that GPTQ quantize_params works unchanged without QEP."""
+  def test_non_reiterable_input_raises(self):
     model = self._make_dense_model()
-    x = jax.random.normal(jax.random.key(0), (5, 32))
-    variables = model.init(jax.random.key(1), x)
+    x = jax.random.normal(jax.random.key(10), (4, 32))
+    variables = model.init(jax.random.key(11), x)
+    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
 
-    rules = [gptq.GptqRule(module_path='Dense_0', weight_qtype=jnp.int8)]
+    with self.assertRaises(ValueError):
+      qep.quantize(model, iter([x]), rules, variables=variables)
 
-    # Standard GPTQ calibration.
-    gptq_cal_provider = gptq.GptqCalibrationProvider(rules)
-    cal_model = qwix_model.quantize_model(model, gptq_cal_provider)
-    _, new_vars = cal_model.apply(variables, x, mutable='quant_stats')
-    cal_variables = {**variables, **new_vars}
+  def test_quantize_params_without_correction_does_not_require_hessian_delta(self):
+    model = self._make_dense_model()
+    x = jax.random.normal(jax.random.key(12), (4, 32))
+    variables = model.init(jax.random.key(13), x)
+    rules = [qep.QepRule(module_path='Dense_0', weight_qtype=jnp.int8)]
+    ptq_model = self._make_ptq_model(model, rules)
+    abs_quantized = self._get_abs_quantized(ptq_model, x)
 
-    ptq_provider = ptq.PtqProvider(rules)
-    ptq_model = qwix_model.quantize_model(model, ptq_provider)
-    abs_variables = jax.eval_shape(ptq_model.init, jax.random.key(2), x)
-
-    # GPTQ quantize_params should work without any QEP args.
-    gptq_params = gptq.quantize_params(
-        variables['params'],
-        abs_variables['params'],
-        cal_variables['quant_stats'],
+    fake_hessian = jnp.eye(32)
+    aggregator = averaging.SimpleMovingAverage()
+    quant_stat = aggregator.update(
+        aggregator.init({'hessian': fake_hessian}),
+        {'hessian': fake_hessian},
     )
-    y = ptq_model.apply({'params': gptq_params}, x)
-    fp_y = model.apply(variables, x)
-    # Sanity check: quantized output is close-ish to float output.
-    mae = lambda a, b: jnp.mean(jnp.abs(a - b))
-    self.assertLess(mae(fp_y, y), 1.0)
+    params = qep.quantize_params(
+        variables['params'],
+        abs_quantized,
+        {'Dense_0': {'kernel_qep': quant_stat}},
+        apply_correction=False,
+    )
+
+    y = ptq_model.apply({'params': params}, x)
+    self.assertEqual(y.shape, (4, 64))
 
 
 if __name__ == '__main__':
