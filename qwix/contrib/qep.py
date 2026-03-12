@@ -104,12 +104,24 @@ class _StageSpec:
 
 
 def _default_batch_adapter(batch: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
+  """Treats one calibration batch as a single positional model argument."""
   return (batch,), {}
 
 
 def _normalize_calibration_data(
     calibration_data: Iterable[Any] | Callable[[], Iterable[Any]]
 ) -> Callable[[], Iterable[Any]]:
+  """Normalizes calibration data into a factory that yields fresh iterables.
+
+  Exact QEP replays the full calibration set once per inferred stage, so the
+  input must be reiterable. This helper accepts either:
+
+  - a zero-arg callable that already returns a fresh iterable, or
+  - a reiterable collection such as a list or tuple.
+
+  A one-shot iterator is rejected because later stages would otherwise see an
+  empty dataset.
+  """
   if callable(calibration_data):
     return calibration_data
   iterator = iter(calibration_data)
@@ -122,26 +134,36 @@ def _normalize_calibration_data(
 
 
 def _mutable_tree(tree: Any) -> Any:
+  """Returns a mutable mapping view of a params tree when needed."""
   if isinstance(tree, flax.core.FrozenDict):
     return flax.core.unfreeze(tree)
   return tree
 
 
 def _flatten_tree(tree: Any) -> dict[tuple[str, ...], Any]:
+  """Flattens a nested params tree into tuple paths for incremental updates."""
   return flax.traverse_util.flatten_dict(_mutable_tree(tree))
 
 
 def _unflatten_tree(flat_tree: dict[tuple[str, ...], Any]) -> Any:
+  """Reconstructs a nested params tree from tuple-path leaves."""
   return flax.traverse_util.unflatten_dict(flat_tree)
 
 
 def _merge_trees(base: Any, updates: Any) -> Any:
+  """Overlays one params subtree onto another by flattened path."""
   base_flat = _flatten_tree(base)
   base_flat.update(_flatten_tree(updates))
   return _unflatten_tree(base_flat)
 
 
 def _dequantize_params_tree(tree: Any) -> Any:
+  """Converts PTQ ``WithAux`` leaves back to float arrays.
+
+  During exact QEP, already-quantized stages are fed back into later calibration
+  passes as dequantized float weights so that subsequent layers observe the
+  correct propagated quantization error in their inputs.
+  """
   return jax.tree.map(
       lambda leaf: (
           qarray.dequantize(leaf.array) if isinstance(leaf, ptq.WithAux) else leaf
@@ -152,6 +174,7 @@ def _dequantize_params_tree(tree: Any) -> Any:
 
 
 def _stats_path(path: tuple[str, ...]) -> tuple[str, ...]:
+  """Maps a weight path such as ``Dense_0/kernel`` to its ``_qep`` stats leaf."""
   return (*path[:-1], path[-1] + '_qep')
 
 
@@ -160,6 +183,12 @@ def _accumulate_flat_stats(
     path: tuple[str, ...],
     stats: dict[str, jax.Array],
 ) -> None:
+  """Accumulates per-weight calibration stats with ``SimpleMovingAverage``.
+
+  ``compute_qep_stats`` returns raw batch-level statistics. QEP needs their
+  dataset-wide averages before quantizing a stage, so this helper maintains the
+  running aggregate in a flat dict keyed by the eventual ``quant_stats`` path.
+  """
   aggregator = averaging.SimpleMovingAverage()
   stat_path = _stats_path(path)
   quant_stat = flat_stats.get(stat_path)
@@ -173,12 +202,24 @@ def _extract_batch(
     batch_adapter: Callable[[Any], tuple[tuple[Any, ...], dict[str, Any]]],
     batch: Any,
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+  """Applies the user batch adapter and normalizes the result types."""
   args, kwargs = batch_adapter(batch)
   return tuple(args), dict(kwargs)
 
 
 class _CaptureProvider(calibration.CalibrationProvider):
-  """CalibrationProvider variant that records matched op metadata and inputs."""
+  """Calibration provider that records matched ops and captured activations.
+
+  Unlike GPTQ/AWQ calibration providers, this provider does not write into the
+  model's ``quant_stats`` collection. Instead, it exposes a Python-side API for
+  two separate tasks used by exact QEP:
+
+  - discovery: enumerate supported matched ops in forward-pass order
+  - capture: record the reshaped LHS activation for a selected set of ops
+
+  The provider still reuses ``CalibrationProvider`` for all rule matching,
+  supported-op validation, weight lookup, and LHS normalization.
+  """
 
   def __init__(self, rules: Collection[qconfig.QuantizationRule]):
     super().__init__(rules)
@@ -187,27 +228,33 @@ class _CaptureProvider(calibration.CalibrationProvider):
     self._captures: dict[tuple[Any, ...], jax.Array] = {}
 
   def get_rule_type(self) -> type[qconfig.QuantizationRule]:
+    """Restricts capture to ops matched by ``QepRule``."""
     return QepRule
 
   def get_stats_suffix(self) -> str:
+    """Returns the suffix associated with QEP calibration stats."""
     return '_qep'
 
   def start_discovery(self) -> None:
+    """Resets provider state before the initial discovery forward pass."""
     self._discovered_ops.clear()
     self._capture_keys = None
     self._captures = {}
 
   def start_capture(self, op_keys: Collection[tuple[Any, ...]]) -> None:
+    """Enables activation capture for the selected ops on the next forward."""
     self._capture_keys = set(op_keys)
     self._captures = {}
 
   def finish_capture(self) -> dict[tuple[Any, ...], jax.Array]:
+    """Returns captured activations from the last forward and clears them."""
     captures = self._captures
     self._captures = {}
     return captures
 
   @property
   def discovered_ops(self) -> tuple[_MatchedOp, ...]:
+    """Matched supported ops seen during discovery, in forward order."""
     return tuple(self._discovered_ops)
 
   def _collect_stats(
@@ -220,6 +267,18 @@ class _CaptureProvider(calibration.CalibrationProvider):
       op_id: str | None,
       lhs_id: int,
   ) -> None:
+    """Records one supported matched op or one requested activation capture.
+
+    ``CalibrationProvider`` calls this only for supported weight-bearing
+    dot/einsum ops. During discovery, this stores enough metadata to later:
+
+    - group sibling ops that share the same input activation,
+    - identify the weight path to quantize, and
+    - re-identify the same op on later forwards.
+
+    During capture, the provider instead records the normalized LHS activation
+    for op keys selected by ``start_capture``.
+    """
     path = (*module_path, weight_name)
     op_key = (op_name, module_path, op_id)
 
@@ -241,6 +300,13 @@ class _CaptureProvider(calibration.CalibrationProvider):
 
 
 def _build_stages(discovered_ops: tuple[_MatchedOp, ...]) -> tuple[_StageSpec, ...]:
+  """Groups discovered ops into inferred QEP stages.
+
+  In the current linen-only design, stages are inferred purely from shared
+  runtime inputs: consecutive matched ops with the same original ``lhs`` object
+  id are treated as one stage. This preserves the intended semantics for common
+  branched patterns such as sibling linear projections fed by the same tensor.
+  """
   if not discovered_ops:
     raise ValueError(
         'No supported QEP ops were discovered. Ensure the rules match '
@@ -275,6 +341,7 @@ def _build_stages(discovered_ops: tuple[_MatchedOp, ...]) -> tuple[_StageSpec, .
 
 
 def _stage_to_public(stage: _StageSpec) -> QepStage:
+  """Converts the internal stage representation into public debug metadata."""
   unique_paths = tuple(dict.fromkeys(op.path for op in stage.members))
   unique_module_paths = tuple(
       dict.fromkeys('/'.join(op.module_path) for op in stage.members)
@@ -293,6 +360,7 @@ def _apply_with_params(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+  """Runs a linen model with a replacement params tree."""
   apply_variables = {**variables, 'params': params}
   return model.apply(apply_variables, *args, **kwargs)
 
@@ -305,6 +373,7 @@ def _prepare_ptq_model(
     sample_kwargs: dict[str, Any],
     abstract_quantized: Any,
 ) -> tuple[nn.Module, Any]:
+  """Builds the PTQ inference model and its abstract quantized params tree."""
   ptq_model = qwix_model.quantize_model(
       model, ptq.PtqProvider(rules), methods=methods
   )
@@ -327,7 +396,14 @@ def _quantize_stage(
     gptq_block_size: int,
     gptq_damping_factor: float,
 ) -> Any:
+  """Quantizes one inferred QEP stage from its finalized calibration stats.
+
+  The stage is always quantized from the original float weights. Previously
+  quantized stages only affect the collected activations, not the source weights
+  being updated here.
+  """
   def _quantize_weight(prepared: calibration.PreparedWeight) -> Any:
+    """Applies optional QEP correction followed by GPTQ for one weight leaf."""
     rule = stage_rules[prepared.path]
     hessian = prepared.calibration_stats['hessian']
     assert (
@@ -405,6 +481,20 @@ def quantize(
   Returns:
     A ``QepResult`` containing the PTQ inference model clone, final quantized
     params, accumulated QEP stats, and inferred stages.
+
+  The algorithm proceeds as follows:
+
+  1. Discover supported matched ops in forward order on one float pass.
+  2. Infer stages by grouping consecutive matched ops that share the same input
+     activation object.
+  3. For each stage, replay the calibration set twice per batch:
+     one float forward and one forward using dequantized weights from already
+     quantized earlier stages.
+  4. Accumulate ``_qep`` stats for the current stage only.
+  5. Quantize that stage from the original float weights, then dequantize the
+     newly quantized leaves into the running params tree for later stages.
+  6. PTQ-quantize any remaining rule-matched weights that never participated in
+     a supported QEP stage.
   """
   if not isinstance(model, nn.Module):
     raise ValueError('qep.quantize currently supports linen models only.')
@@ -534,6 +624,25 @@ def quantize_params(
 
   This helper consumes existing ``_qep`` stats and applies QEP correction plus
   GPTQ, but it does not run the exact stagewise reference algorithm by itself.
+
+  Args:
+    params: Floating-point params to quantize.
+    abstract_quantized_params: PTQ abstract params tree containing ``WithAux``
+      leaves that describe how each supported weight should be quantized.
+    qep_quant_stats: Pure ``_qep`` stats tree, typically produced by
+      :func:`quantize`.
+    allow_extra_params: Passed through to ``ptq.quantize_params`` for PTQ
+      fallback leaves.
+    gptq_block_size: GPTQ block size for each quantized weight.
+    gptq_damping_factor: GPTQ Hessian damping factor.
+    correction_factor: QEP correction factor used when
+      ``apply_correction=True``.
+    damping_factor: QEP Hessian damping factor used when
+      ``apply_correction=True``.
+    apply_correction: If ``True``, apply the QEP weight correction before GPTQ.
+
+  Returns:
+    A params tree consumable by ``PtqProvider``.
   """
 
   def _quantize(prepared: calibration.PreparedWeight) -> Any:

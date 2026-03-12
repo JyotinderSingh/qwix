@@ -81,6 +81,17 @@ class CalibrationProvider(
       op_id: str | None = None,
       **kwargs,
   ) -> jax.Array:
+    """Intercepts supported weight-bearing ``dot_general`` ops for calibration.
+
+    Subclasses do not need to reimplement the common matching and validation
+    logic. This method:
+
+    - resolves the active quantization rule and op id,
+    - rejects unsupported dimension-number patterns,
+    - identifies the weight parameter on the RHS,
+    - reshapes the LHS to ``(contracting_dim, rest)``, and
+    - delegates the actual stats handling to ``_collect_stats``.
+    """
     res = jax.lax.dot_general(lhs, rhs, dimension_numbers, *args, **kwargs)
     if rule is None or op_id is None:
       rule, op_id = self._get_current_rule_and_op_id('dot_general')
@@ -117,6 +128,7 @@ class CalibrationProvider(
     return res
 
   def einsum(self, einsum_str, *operands, **kwargs):
+    """Intercepts supported binary ``einsum`` ops via their lowered dot call."""
     rule, op_id = self._get_current_rule_and_op_id('einsum')
     rule_type = self.get_rule_type()
     if not isinstance(rule, rule_type):
@@ -167,6 +179,7 @@ class SinglePassCalibrationProvider(CalibrationProvider, metaclass=abc.ABCMeta):
       op_id: str | None,
       lhs_id: int,
   ) -> None:
+    """Accumulates one batch of single-pass calibration statistics."""
     del module_path, op_name, op_id, lhs_id
     stats = self.compute_stats(lhs)
     aggregator = averaging.SimpleMovingAverage()
