@@ -15,7 +15,7 @@
 
 import abc
 import dataclasses
-from typing import Any, Callable, Collection
+from typing import Any, Callable
 
 import flax
 from flax import nnx
@@ -251,7 +251,6 @@ def quantize_params_with_calibration(
     quantize_fn: Callable[[PreparedWeight], Any],
     *,
     allow_extra_params: bool = False,
-    selected_paths: Collection[tuple[str, ...]] | None = None,
     ptq_fallback: bool = True,
 ) -> Any:
   """Shared framework for calibration-based weight quantization.
@@ -271,19 +270,15 @@ def quantize_params_with_calibration(
       quantized result to store in the output tree.
     allow_extra_params: If True, allow extra parameters not in
       abstract_quantized_params.
-    selected_paths: If set, only quantize these param paths.
-    ptq_fallback: If True, PTQ-quantize non-selected or missing-stat params.
+    ptq_fallback: If True, PTQ-quantize params that are not handled by the
+      calibration-based path.
 
   Returns:
     The quantized params tree.
   """
-  selected_paths = None if selected_paths is None else set(selected_paths)
   quantized_params = {}
   not_quantized_params = {}
   for path, w in flax.traverse_util.flatten_dict(params).items():
-    if selected_paths is not None and path not in selected_paths:
-      not_quantized_params[path] = w
-      continue
     abs_w = ptq.get_value_from_path(abstract_quantized_params, path)
     stats_path = (*path[:-1], path[-1] + stats_suffix)
     stats = ptq.get_value_from_path(quant_stats, stats_path)

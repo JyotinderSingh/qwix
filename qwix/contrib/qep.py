@@ -442,7 +442,6 @@ def _quantize_stage(
       quant_stats,
       '_qep',
       _quantize_weight,
-      selected_paths=tuple(stage_rules),
       ptq_fallback=False,
   )
 

@@ -189,8 +189,8 @@ class QuantizeParamsWithCalibrationTest(parameterized.TestCase):
     y_direct = ptq_model.apply({'params': direct_result}, x)
     self.assertTrue(jnp.allclose(y_shared, y_direct))
 
-  def test_selected_paths_without_ptq_fallback_returns_partial_tree(self):
-    rules = [gptq.GptqRule(module_path='Dense_.*', weight_qtype=jnp.int8)]
+  def test_without_ptq_fallback_returns_partial_tree(self):
+    rules = [gptq.GptqRule(module_path='Dense_0', weight_qtype=jnp.int8)]
     _, _, x, variables, abs_variables = self._setup_model_and_stats(rules)
 
     def mock_quantize(prepared):
@@ -204,7 +204,6 @@ class QuantizeParamsWithCalibrationTest(parameterized.TestCase):
         variables['quant_stats'],
         '_gptq',
         mock_quantize,
-        selected_paths={('Dense_0', 'kernel')},
         ptq_fallback=False,
     )
 
