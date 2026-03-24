@@ -20,6 +20,8 @@ from flax import linen as nn
 from flax import nnx
 import flax.linen.dtypes
 import jax
+from jax._src import mesh as jax_mesh_lib
+from jax import numpy as jnp
 from qwix._src import averaging
 from qwix._src import flax_util
 from qwix._src import qconfig
@@ -72,6 +74,9 @@ class WithAux(Generic[ArrayTypeVar]):
 
 # Register as NNX data to allow JAX arrays in Module attributes.
 nnx.register_data_type(WithAux)
+
+
+_PREQUANTIZED_ARRAY_LEAF_NAMES = frozenset(('qvalue', 'scale', 'zero_point'))
 
 
 class PtqProvider(qconfig.QuantizationProvider):
@@ -533,10 +538,212 @@ def quantize_params(
   return flax.traverse_util.unflatten_dict(quantized_params)
 
 
+def process_prequantized_params(
+    prequantized_params: Any,
+    abstract_quantized_params: Any,
+    *,
+    allow_extra_params: bool = False,
+) -> Any:
+  """Converts pre-quantized NNX params into a PTQ runtime-compatible pure dict.
+
+  This helper reconstructs the same `nnx.update`-friendly pure dict shape
+  returned by `quantize_params`, but starts from pre-quantized weight payloads
+  produced outside of Qwix. The quantization metadata (`HowToQuantize` and
+  `qtype`) is always sourced from `abstract_quantized_params`.
+
+  Args:
+    prequantized_params: A nested dict matching NNX state paths. Quantized
+      params must use the shape `param -> array -> qvalue`, `scale`, and
+      optional `zero_point`. Non-quantized params remain plain array leaves.
+    abstract_quantized_params: An NNX PTQ model, possibly abstract, created
+      from `nnx.eval_shape(...)`.
+    allow_extra_params: If True, ignore payload entries that are not present in
+      `abstract_quantized_params`.
+
+  Returns:
+    A pure dict consumable by `nnx.update`.
+  """
+  if not isinstance(abstract_quantized_params, nnx.Module):
+    raise TypeError(
+        'process_prequantized_params only supports NNX PTQ models. Got'
+        f' {type(abstract_quantized_params)}.'
+    )
+
+  grouped_quantized_params, plain_params = _group_prequantized_params(
+      prequantized_params
+  )
+
+  processed_params = {}
+  for path, payload in grouped_quantized_params.items():
+    abs_param = get_value_from_path(abstract_quantized_params, path)
+    if abs_param is None:
+      if allow_extra_params:
+        continue
+      raise ValueError(f'{path} is not found in the abstract_quantized_params.')
+    if not isinstance(abs_param, WithAux):
+      raise ValueError(
+          f'{path} is not a quantized param in the abstract_quantized_params.'
+      )
+    processed_params[path] = _process_quantized_param_payload(
+        payload, abs_param, path
+    )
+
+  for path, param in plain_params.items():
+    abs_param = get_value_from_path(abstract_quantized_params, path)
+    if abs_param is None:
+      if allow_extra_params:
+        continue
+      raise ValueError(f'{path} is not found in the abstract_quantized_params.')
+    if isinstance(abs_param, WithAux):
+      raise ValueError(
+          f'{path} is quantized in the abstract_quantized_params. Expected a'
+          " payload shaped like {'array': {'qvalue': ..., 'scale': ..."
+          "}}."
+      )
+    processed_params[path] = _coerce_prequantized_leaf(param, abs_param, path)
+
+  processed_params = flax.traverse_util.unflatten_dict(processed_params)
+  return nnx.to_pure_dict(nnx.state(processed_params))
+
+
+def _group_prequantized_params(
+    prequantized_params: Any,
+) -> tuple[dict[tuple[str, ...], dict[str, Any]], dict[tuple[str, ...], Any]]:
+  """Groups quantized payload leaves by param path."""
+  grouped_quantized_params = {}
+  plain_params = {}
+  flat_params = flax.traverse_util.flatten_dict(prequantized_params)
+
+  for path, value in flat_params.items():
+    if path[-1] in _PREQUANTIZED_ARRAY_LEAF_NAMES:
+      if len(path) < 2 or path[-2] != 'array':
+        raise ValueError(
+            f'{path} must be nested under an "array" field in'
+            ' prequantized_params.'
+        )
+      param_path = path[:-2]
+      if param_path in plain_params:
+        raise ValueError(
+            f'{param_path} mixes quantized payload leaves with a plain array'
+            ' leaf.'
+        )
+      payload = grouped_quantized_params.setdefault(param_path, {})
+      payload[path[-1]] = value
+    elif len(path) >= 2 and path[-2] == 'array':
+      raise ValueError(
+          f'{path} is not a supported quantized payload leaf. Expected one of'
+          f' {sorted(_PREQUANTIZED_ARRAY_LEAF_NAMES)}.'
+      )
+    elif path[-1] == 'array':
+      raise ValueError(
+          f'{path} must contain nested qvalue/scale entries, not a leaf array.'
+      )
+    else:
+      if path in grouped_quantized_params:
+        raise ValueError(
+            f'{path} mixes a plain array leaf with quantized payload leaves.'
+        )
+      plain_params[path] = value
+
+  return grouped_quantized_params, plain_params
+
+
+def _coerce_prequantized_leaf(
+    value: Any,
+    abstract_value: Any,
+    path: tuple[str, ...],
+) -> jax.Array:
+  """Converts a host/device array-like value into the template's array shape."""
+  abstract_value = flax_util.unbox(abstract_value)
+  if not hasattr(abstract_value, 'shape') or not hasattr(abstract_value, 'dtype'):
+    raise TypeError(
+        f'{path} does not resolve to an array-like leaf in the'
+        ' abstract_quantized_params.'
+    )
+
+  value = jnp.asarray(value, dtype=abstract_value.dtype)
+  if value.shape != abstract_value.shape:
+    raise ValueError(
+        f'{path} has shape {value.shape}, expected {abstract_value.shape}.'
+    )
+
+  sharding = getattr(abstract_value, 'sharding', None)
+  sharding = _resolve_prequantized_sharding(sharding, path)
+  if sharding is not None and getattr(value, 'sharding', None) != sharding:
+    value = jax.device_put(value, sharding)
+  return value
+
+
+def _resolve_prequantized_sharding(
+    sharding: Any,
+    path: tuple[str, ...],
+) -> jax.sharding.Sharding | None:
+  """Resolves abstract mesh shardings into concrete device shardings."""
+  if sharding is None:
+    return None
+  if (
+      isinstance(sharding, jax.sharding.NamedSharding)
+      and isinstance(sharding.mesh, jax.sharding.AbstractMesh)
+  ):
+    concrete_mesh = jax_mesh_lib.get_concrete_mesh()
+    if concrete_mesh.empty:
+      raise ValueError(
+          f'{path} requires an active concrete mesh to place pre-quantized'
+          ' arrays. Run process_prequantized_params inside the same'
+          ' jax.set_mesh(...) context used for the sharded PTQ model.'
+      )
+    return jax.sharding.NamedSharding(concrete_mesh, sharding.spec)
+  return sharding
+
+
+def _process_quantized_param_payload(
+    payload: dict[str, Any],
+    abs_param: WithAux[qarray.QArray],
+    path: tuple[str, ...],
+) -> WithAux[qarray.QArray]:
+  """Builds a WithAux[QArray] leaf from an Orbax-style quantized payload."""
+  if 'qvalue' not in payload:
+    raise ValueError(f'{path} is missing required quantized leaf "qvalue".')
+  if 'scale' not in payload:
+    raise ValueError(f'{path} is missing required quantized leaf "scale".')
+
+  abs_array = abs_param.array
+  qvalue = _coerce_prequantized_leaf(payload['qvalue'], abs_array.qvalue, path)
+  scale = _coerce_prequantized_leaf(payload['scale'], abs_array.scale, path)
+
+  expected_zero_point = abs_array.zero_point
+  zero_point = payload.get('zero_point')
+  if expected_zero_point is None and zero_point is not None:
+    raise ValueError(
+        f'{path} provided an unexpected "zero_point" for a symmetric'
+        ' quantized param.'
+    )
+  if expected_zero_point is not None and zero_point is None:
+    raise ValueError(
+        f'{path} is missing required quantized leaf "zero_point".'
+    )
+  if expected_zero_point is not None:
+    zero_point = _coerce_prequantized_leaf(
+        zero_point, expected_zero_point, path
+    )
+
+  qarray_leaf = qarray.QArray(
+      qvalue=qvalue,
+      scale=scale,
+      zero_point=zero_point,
+      qtype=abs_param.how.qtype,
+  )
+  qarray.validate_qarray(qarray_leaf)
+  return abs_param.replace(array=qarray_leaf)
+
+
 def get_value_from_path(obj, path: tuple[str, ...]):
   """Helper that returns the value from the path in the object."""
   for key in path:
     if obj is None:
       return None
-    obj = obj.get(key) if isinstance(obj, dict) else getattr(obj, key)
+    if isinstance(obj, dict):
+      obj = obj.get(key)
+    else:
+      obj = getattr(obj, key, None)
   return obj

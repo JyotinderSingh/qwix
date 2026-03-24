@@ -22,6 +22,7 @@ import jax
 from jax import export
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
+import numpy as np
 from qwix._src import flax_util
 from qwix._src import model as qwix_model
 from qwix._src import qconfig
@@ -29,6 +30,47 @@ from qwix._src.providers import ptq
 from qwix._src.providers import qt
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+
+
+def _assert_trees_allclose(testcase, lhs, rhs):
+  jax.tree.map_with_path(
+      lambda kp, x, y: testcase.assertTrue(jnp.allclose(x, y), f"{kp} {x} {y}"),
+      lhs,
+      rhs,
+  )
+
+
+def _get_canonical_named_sharding(x: jax.Array):
+  sharding = x.sharding
+  if not isinstance(sharding, jax.sharding.NamedSharding):
+    return sharding
+  padded_pspec = sharding.spec + (None,) * (x.ndim - len(sharding.spec))
+  return sharding.update(spec=padded_pspec)
+
+
+def _to_orbax_payload(tree):
+  return jax.tree.map(
+      lambda x: np.asarray(jax.device_get(x)) if isinstance(x, jax.Array) else x,
+      tree,
+  )
+
+
+def _build_linear_reference(q_rules, model_input):
+  fp_linear = nnx.Linear(
+      in_features=model_input.shape[-1],
+      out_features=6,
+      rngs=nnx.Rngs(0),
+  )
+  abs_ptq_linear = nnx.eval_shape(
+      lambda: qwix_model.quantize_model(
+          fp_linear,
+          ptq.PtqProvider(q_rules),
+          model_input,
+      )
+  )
+  orig_params = nnx.to_pure_dict(nnx.state(fp_linear, nnx.Param))
+  reference_params = ptq.quantize_params(orig_params, abs_ptq_linear)
+  return abs_ptq_linear, orig_params, reference_params
 
 
 class PtqTest(parameterized.TestCase):
@@ -207,6 +249,197 @@ class PtqTest(parameterized.TestCase):
         nnx.state(abs_ptq_linear),
         nnx.state(ptq_linear),
     )
+
+  def test_process_prequantized_params_nnx(self):
+    q_rules = [
+        qconfig.QuantizationRule(
+            module_path=".*", weight_qtype=jnp.int8, tile_size=4
+        ),
+    ]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, orig_params, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+
+    orbax_payload = _to_orbax_payload(reference_params)
+    processed_params = ptq.process_prequantized_params(
+        orbax_payload, abs_ptq_linear
+    )
+
+    self.assertTrue(jnp.allclose(processed_params["bias"], orig_params["bias"]))
+    _assert_trees_allclose(self, processed_params, reference_params)
+
+    nnx.update(abs_ptq_linear, processed_params)
+    abs_ptq_linear(model_input)
+
+  def test_process_prequantized_params_nnx_einsum_sharding(self):
+    mesh = jax.make_mesh(
+        (2, 2),
+        ("fsdp", "tp"),
+        axis_types=(jax.sharding.AxisType.Auto,) * len(("fsdp", "tp")),
+    )
+    q_rules = [
+        qconfig.QuantizationRule(
+            module_path=".*", weight_qtype=jnp.int8, tile_size=4
+        ),
+    ]
+    model_input = jnp.ones((10, 1, 16))
+    with jax.set_mesh(mesh):
+      fp_einsum = nnx.Einsum(
+          "btd,dnh->btnh",
+          (16, 8, 10),
+          (8, 10),
+          rngs=nnx.Rngs(0),
+          kernel_init=nnx.with_partitioning(
+              nnx.initializers.lecun_normal(), ("fsdp", "tp", None)
+          ),
+          bias_init=nnx.with_partitioning(nnx.initializers.zeros, ("tp", None)),
+      )
+
+    unsharded_state = nnx.state(fp_einsum)
+    sharding = nnx.get_named_sharding(unsharded_state, mesh)
+    sharded_state = jax.device_put(unsharded_state, sharding)
+    nnx.update(fp_einsum, sharded_state)
+
+    with jax.set_mesh(mesh):
+      abs_ptq_einsum = nnx.eval_shape(
+          lambda: qwix_model.quantize_model(
+              fp_einsum,
+              ptq.PtqProvider(q_rules),
+              model_input,
+          ),
+      )
+
+    orig_params = nnx.to_pure_dict(nnx.state(fp_einsum, nnx.Param))
+    reference_params = ptq.quantize_params(orig_params, abs_ptq_einsum)
+    orbax_payload = _to_orbax_payload(reference_params)
+
+    with jax.set_mesh(mesh):
+      processed_params = ptq.process_prequantized_params(
+          orbax_payload, abs_ptq_einsum
+      )
+    _assert_trees_allclose(self, processed_params, reference_params)
+    jax.tree.map_with_path(
+        lambda kp, x, y: self.assertEqual(
+            _get_canonical_named_sharding(x),
+            _get_canonical_named_sharding(y),
+            f"{kp} {x.sharding} {y.sharding}",
+        ),
+        processed_params,
+        reference_params,
+    )
+
+    with jax.set_mesh(mesh):
+      nnx.update(abs_ptq_einsum, processed_params)
+      abs_ptq_einsum(model_input)
+
+  def test_process_prequantized_params_nnx_asymmetric(self):
+    q_rules = [
+        qconfig.QuantizationRule(
+            module_path=".*",
+            weight_qtype=jnp.int8,
+            weight_calibration_method="minmax",
+        ),
+    ]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+
+    self.assertIn("zero_point", reference_params["kernel"]["array"])
+    orbax_payload = _to_orbax_payload(reference_params)
+    processed_params = ptq.process_prequantized_params(
+        orbax_payload, abs_ptq_linear
+    )
+
+    _assert_trees_allclose(self, processed_params, reference_params)
+
+  def test_process_prequantized_params_missing_qvalue(self):
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+    orbax_payload = _to_orbax_payload(reference_params)
+    del orbax_payload["kernel"]["array"]["qvalue"]
+
+    with self.assertRaisesRegex(ValueError, "qvalue"):
+      ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
+
+  def test_process_prequantized_params_missing_scale(self):
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+    orbax_payload = _to_orbax_payload(reference_params)
+    del orbax_payload["kernel"]["array"]["scale"]
+
+    with self.assertRaisesRegex(ValueError, "scale"):
+      ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
+
+  def test_process_prequantized_params_wrong_shape(self):
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+    orbax_payload = _to_orbax_payload(reference_params)
+    orbax_payload["kernel"]["array"]["qvalue"] = orbax_payload["kernel"][
+        "array"
+    ]["qvalue"][:-1]
+
+    with self.assertRaisesRegex(ValueError, "shape"):
+      ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
+
+  def test_process_prequantized_params_rejects_unexpected_zero_point(self):
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+    orbax_payload = _to_orbax_payload(reference_params)
+    orbax_payload["kernel"]["array"]["zero_point"] = np.zeros_like(
+        orbax_payload["kernel"]["array"]["scale"],
+        dtype=orbax_payload["kernel"]["array"]["qvalue"].dtype,
+    )
+
+    with self.assertRaisesRegex(ValueError, "unexpected"):
+      ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
+
+  def test_process_prequantized_params_allow_extra_params(self):
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    model_input = jnp.ones((10, 12))
+    abs_ptq_linear, _, reference_params = _build_linear_reference(
+        q_rules, model_input
+    )
+    orbax_payload = _to_orbax_payload(reference_params)
+    orbax_payload["extra"] = np.ones((1,), dtype=np.float32)
+
+    with self.assertRaisesRegex(ValueError, "extra"):
+      ptq.process_prequantized_params(
+          orbax_payload,
+          abs_ptq_linear,
+          allow_extra_params=False,
+      )
+
+    processed_params = ptq.process_prequantized_params(
+        orbax_payload,
+        abs_ptq_linear,
+        allow_extra_params=True,
+    )
+    self.assertNotIn("extra", processed_params)
+
+  def test_process_prequantized_params_rejects_linen_template(self):
+    dense = nn.Dense(features=5)
+    q_rules = [qconfig.QuantizationRule(weight_qtype=jnp.int8)]
+    ptq_dense = qwix_model.quantize_model(dense, ptq.PtqProvider(q_rules))
+    abs_ptq_params = jax.eval_shape(
+        ptq_dense.init, jax.random.key(0), jnp.ones((10, 12))
+    )["params"]
+
+    with self.assertRaisesRegex(TypeError, "NNX PTQ models"):
+      ptq.process_prequantized_params({}, abs_ptq_params)
 
   def test_nnx_einsum_sharding_ptq(self):
     mesh = jax.make_mesh(

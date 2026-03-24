@@ -103,6 +103,44 @@ subtree of `fp_params`. For example, we could load the checkpoints layer by
 layer and quantize each layer immediately, which is known as **pipelined
 checkpoint loading and quantization**.
 
+### Processing pre-quantized NNX weights
+
+When weights are pre-quantized outside of Qwix, `process_prequantized_params`
+can convert them into the same `nnx.update`-friendly pure dict shape returned by
+`quantize_params`.
+
+This helper is NNX-only. The quantization metadata is still sourced from the
+abstract PTQ model, not the external checkpoint payload.
+
+```py
+# Orbax emits a nested NNX-path payload of host NumPy arrays.
+prequantized_params = ...
+
+# Create an abstract PTQ model, which serves as the template for metadata,
+# shapes, dtypes, and sharding.
+abs_ptq_model = nnx.eval_shape(create_quantized_model)
+
+ptq_params = qwix.process_prequantized_params(
+    prequantized_params,
+    abs_ptq_model,
+)
+
+# Update the abstract model with the processed params.
+nnx.update(abs_ptq_model, ptq_params)
+abs_ptq_model(model_input)
+```
+
+The stable Orbax -> Qwix payload contract is:
+
+*   Quantized param: `param -> array -> qvalue`, `scale`, optional `zero_point`
+*   Non-quantized param: plain array leaf
+*   `how` and `qtype` are not serialized in the payload; Qwix recovers them
+    from the abstract PTQ model
+
+If the abstract PTQ model includes sharding metadata from `jax.set_mesh(...)`,
+run `process_prequantized_params` under the same mesh context so the restored
+arrays can be placed onto devices correctly.
+
 ### Alternative way to quantize weights
 
 For smaller models where HBM limit is not a concern, weight quantization can be

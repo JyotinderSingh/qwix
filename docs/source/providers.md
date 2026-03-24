@@ -28,6 +28,8 @@ model without requiring a full retraining loop.
   :undoc-members:
 
 .. autofunction:: qwix.quantize_params
+
+.. autofunction:: qwix.process_prequantized_params
 ```
 
 ## On-Device ML (ODML)
