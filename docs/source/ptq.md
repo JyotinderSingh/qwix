@@ -132,7 +132,7 @@ abs_ptq_model(model_input)
 
 The stable Orbax -> Qwix payload contract is:
 
-*   Quantized param: `param -> array -> qvalue`, `scale`, optional `zero_point`
+*   Quantized param: `param -> qvalue`, `scale`, optional `zero_point`
 *   Non-quantized param: plain array leaf
 *   `how` and `qtype` are not serialized in the payload; Qwix recovers them
     from the abstract PTQ model

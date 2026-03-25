@@ -49,10 +49,16 @@ def _get_canonical_named_sharding(x: jax.Array):
 
 
 def _to_orbax_payload(tree):
-  return jax.tree.map(
-      lambda x: np.asarray(jax.device_get(x)) if isinstance(x, jax.Array) else x,
-      tree,
-  )
+  if isinstance(tree, dict):
+    if set(tree) == {"array"} and isinstance(tree["array"], dict):
+      array_payload = tree["array"]
+      if set(array_payload) <= {"qvalue", "scale", "zero_point"}:
+        return {
+            key: _to_orbax_payload(value)
+            for key, value in array_payload.items()
+        }
+    return {key: _to_orbax_payload(value) for key, value in tree.items()}
+  return np.asarray(jax.device_get(tree)) if isinstance(tree, jax.Array) else tree
 
 
 def _build_linear_reference(q_rules, model_input):
@@ -361,7 +367,7 @@ class PtqTest(parameterized.TestCase):
         q_rules, model_input
     )
     orbax_payload = _to_orbax_payload(reference_params)
-    del orbax_payload["kernel"]["array"]["qvalue"]
+    del orbax_payload["kernel"]["qvalue"]
 
     with self.assertRaisesRegex(ValueError, "qvalue"):
       ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
@@ -373,7 +379,7 @@ class PtqTest(parameterized.TestCase):
         q_rules, model_input
     )
     orbax_payload = _to_orbax_payload(reference_params)
-    del orbax_payload["kernel"]["array"]["scale"]
+    del orbax_payload["kernel"]["scale"]
 
     with self.assertRaisesRegex(ValueError, "scale"):
       ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
@@ -385,9 +391,7 @@ class PtqTest(parameterized.TestCase):
         q_rules, model_input
     )
     orbax_payload = _to_orbax_payload(reference_params)
-    orbax_payload["kernel"]["array"]["qvalue"] = orbax_payload["kernel"][
-        "array"
-    ]["qvalue"][:-1]
+    orbax_payload["kernel"]["qvalue"] = orbax_payload["kernel"]["qvalue"][:-1]
 
     with self.assertRaisesRegex(ValueError, "shape"):
       ptq.process_prequantized_params(orbax_payload, abs_ptq_linear)
@@ -399,9 +403,9 @@ class PtqTest(parameterized.TestCase):
         q_rules, model_input
     )
     orbax_payload = _to_orbax_payload(reference_params)
-    orbax_payload["kernel"]["array"]["zero_point"] = np.zeros_like(
-        orbax_payload["kernel"]["array"]["scale"],
-        dtype=orbax_payload["kernel"]["array"]["qvalue"].dtype,
+    orbax_payload["kernel"]["zero_point"] = np.zeros_like(
+        orbax_payload["kernel"]["scale"],
+        dtype=orbax_payload["kernel"]["qvalue"].dtype,
     )
 
     with self.assertRaisesRegex(ValueError, "unexpected"):

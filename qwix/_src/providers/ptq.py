@@ -553,8 +553,8 @@ def process_prequantized_params(
 
   Args:
     prequantized_params: A nested dict matching NNX state paths. Quantized
-      params must use the shape `param -> array -> qvalue`, `scale`, and
-      optional `zero_point`. Non-quantized params remain plain array leaves.
+      params use the flat shape `param -> qvalue`, `scale`, and optional
+      `zero_point`. Non-quantized params remain plain array leaves.
     abstract_quantized_params: An NNX PTQ model, possibly abstract, created
       from `nnx.eval_shape(...)`.
     allow_extra_params: If True, ignore payload entries that are not present in
@@ -569,83 +569,70 @@ def process_prequantized_params(
         f' {type(abstract_quantized_params)}.'
     )
 
-  grouped_quantized_params, plain_params = _group_prequantized_params(
-      prequantized_params
+  processed_params = _process_prequantized_subtree(
+      prequantized_params,
+      abstract_quantized_params,
+      path=(),
+      allow_extra_params=allow_extra_params,
   )
-
-  processed_params = {}
-  for path, payload in grouped_quantized_params.items():
-    abs_param = get_value_from_path(abstract_quantized_params, path)
-    if abs_param is None:
-      if allow_extra_params:
-        continue
-      raise ValueError(f'{path} is not found in the abstract_quantized_params.')
-    if not isinstance(abs_param, WithAux):
-      raise ValueError(
-          f'{path} is not a quantized param in the abstract_quantized_params.'
-      )
-    processed_params[path] = _process_quantized_param_payload(
-        payload, abs_param, path
-    )
-
-  for path, param in plain_params.items():
-    abs_param = get_value_from_path(abstract_quantized_params, path)
-    if abs_param is None:
-      if allow_extra_params:
-        continue
-      raise ValueError(f'{path} is not found in the abstract_quantized_params.')
-    if isinstance(abs_param, WithAux):
-      raise ValueError(
-          f'{path} is quantized in the abstract_quantized_params. Expected a'
-          " payload shaped like {'array': {'qvalue': ..., 'scale': ..."
-          "}}."
-      )
-    processed_params[path] = _coerce_prequantized_leaf(param, abs_param, path)
-
-  processed_params = flax.traverse_util.unflatten_dict(processed_params)
   return nnx.to_pure_dict(nnx.state(processed_params))
 
 
-def _group_prequantized_params(
+def _process_prequantized_subtree(
     prequantized_params: Any,
-) -> tuple[dict[tuple[str, ...], dict[str, Any]], dict[tuple[str, ...], Any]]:
-  """Groups quantized payload leaves by param path."""
-  grouped_quantized_params = {}
-  plain_params = {}
-  flat_params = flax.traverse_util.flatten_dict(prequantized_params)
+    abstract_quantized_params: Any,
+    *,
+    path: tuple[str, ...],
+    allow_extra_params: bool,
+) -> Any:
+  """Processes a pre-quantized subtree using the abstract PTQ template."""
+  if isinstance(abstract_quantized_params, WithAux):
+    payload = _validate_prequantized_payload(prequantized_params, path)
+    return _process_quantized_param_payload(
+        payload, abstract_quantized_params, path
+    )
 
-  for path, value in flat_params.items():
-    if path[-1] in _PREQUANTIZED_ARRAY_LEAF_NAMES:
-      if len(path) < 2 or path[-2] != 'array':
-        raise ValueError(
-            f'{path} must be nested under an "array" field in'
-            ' prequantized_params.'
-        )
-      param_path = path[:-2]
-      if param_path in plain_params:
-        raise ValueError(
-            f'{param_path} mixes quantized payload leaves with a plain array'
-            ' leaf.'
-        )
-      payload = grouped_quantized_params.setdefault(param_path, {})
-      payload[path[-1]] = value
-    elif len(path) >= 2 and path[-2] == 'array':
-      raise ValueError(
-          f'{path} is not a supported quantized payload leaf. Expected one of'
-          f' {sorted(_PREQUANTIZED_ARRAY_LEAF_NAMES)}.'
+  if isinstance(prequantized_params, dict):
+    processed_params = {}
+    for key, value in prequantized_params.items():
+      child_path = (*path, key)
+      abs_param = get_value_from_path(abstract_quantized_params, (key,))
+      if abs_param is None:
+        if allow_extra_params:
+          continue
+        raise ValueError(f'{child_path} is not found in the abstract_quantized_params.')
+      processed_params[key] = _process_prequantized_subtree(
+          value,
+          abs_param,
+          path=child_path,
+          allow_extra_params=allow_extra_params,
       )
-    elif path[-1] == 'array':
-      raise ValueError(
-          f'{path} must contain nested qvalue/scale entries, not a leaf array.'
-      )
-    else:
-      if path in grouped_quantized_params:
-        raise ValueError(
-            f'{path} mixes a plain array leaf with quantized payload leaves.'
-        )
-      plain_params[path] = value
+    return processed_params
 
-  return grouped_quantized_params, plain_params
+  return _coerce_prequantized_leaf(
+      prequantized_params, abstract_quantized_params, path
+  )
+
+
+def _validate_prequantized_payload(
+    payload: Any,
+    path: tuple[str, ...],
+) -> dict[str, Any]:
+  """Validates the flat quantized payload format."""
+  if not isinstance(payload, dict):
+    raise ValueError(
+      f'{path} is quantized in the abstract_quantized_params. Expected a'
+      ' dict containing qvalue/scale leaves.'
+    )
+
+  unsupported_keys = set(payload) - _PREQUANTIZED_ARRAY_LEAF_NAMES
+  if unsupported_keys:
+    raise ValueError(
+        f'{path} has unsupported quantized payload leaves'
+        f' {sorted(unsupported_keys)}. Expected only'
+        f' {sorted(_PREQUANTIZED_ARRAY_LEAF_NAMES)}.'
+    )
+  return payload
 
 
 def _coerce_prequantized_leaf(
