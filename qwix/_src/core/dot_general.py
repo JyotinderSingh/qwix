@@ -132,6 +132,72 @@ def _broadcast_axes(
   return jnp.broadcast_to(array, target_shape)
 
 
+def _dot_general_with_int_layout_fix(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    dimension_numbers: jax.lax.DotDimensionNumbers,
+    **kwargs,
+) -> jax.Array:
+  """jax.lax.dot_general that is safe for integer inputs on all backends.
+
+  XLA's CPU backend miscompiles integer dot_general (e.g. int8 x int8) for some
+  non-canonical dimension-number layouts, silently returning wrong values. Such
+  layouts routinely arise here because `einsum` lets `opt_einsum` reorder the
+  operands (e.g. `...ab,bc->...ac` is contracted as `bc,fab->fac`), which leaves
+  the contracting/batch axes in positions that the buggy path mishandles.
+
+  To avoid it, integer operands are transposed into the canonical batched-matmul
+  layout -- lhs `[batch..., free..., contract...]` and rhs
+  `[batch..., contract..., free...]` -- before the contraction. dot_general's
+  output ordering `[batch, lhs_free, rhs_free]` is preserved exactly by this
+  relayout, and integer arithmetic is exact and order-independent, so the
+  returned values are bit-identical to a direct `jax.lax.dot_general` on TPU/GPU
+  (where every layout is already computed correctly). Non-integer inputs and
+  already-canonical integer inputs are passed through unchanged, so the common
+  floating-point path is untouched.
+
+  Args:
+    lhs: The left-hand side.
+    rhs: The right-hand side.
+    dimension_numbers: The dimension numbers passed to dot_general.
+    **kwargs: Additional keyword arguments to jax.lax.dot_general.
+
+  Returns:
+    The result of the dot_general.
+  """
+  if not (
+      jnp.issubdtype(lhs.dtype, jnp.integer)
+      and jnp.issubdtype(rhs.dtype, jnp.integer)
+  ):
+    return jax.lax.dot_general(lhs, rhs, dimension_numbers, **kwargs)
+
+  (lhs_ca, rhs_ca), (lhs_ba, rhs_ba) = dimension_numbers
+  lhs_free = [a for a in range(lhs.ndim) if a not in lhs_ca and a not in lhs_ba]
+  rhs_free = [a for a in range(rhs.ndim) if a not in rhs_ca and a not in rhs_ba]
+  lhs_perm = list(lhs_ba) + lhs_free + list(lhs_ca)
+  rhs_perm = list(rhs_ba) + list(rhs_ca) + rhs_free
+
+  # If the operands are already in canonical layout, don't perturb the program.
+  if lhs_perm == list(range(lhs.ndim)) and rhs_perm == list(range(rhs.ndim)):
+    return jax.lax.dot_general(lhs, rhs, dimension_numbers, **kwargs)
+
+  num_ba = len(lhs_ba)
+  num_ca = len(lhs_ca)
+  new_dimension_numbers = (
+      (
+          tuple(range(lhs.ndim - num_ca, lhs.ndim)),
+          tuple(range(num_ba, num_ba + num_ca)),
+      ),
+      (tuple(range(num_ba)), tuple(range(num_ba))),
+  )
+  return jax.lax.dot_general(
+      lhs.transpose(lhs_perm),
+      rhs.transpose(rhs_perm),
+      new_dimension_numbers,
+      **kwargs,
+  )
+
+
 def _fast_dot_general(
     lhs: qarray.MaybeQArray,
     rhs: qarray.MaybeQArray,
@@ -217,7 +283,7 @@ def _fast_dot_general(
       lhs, rhs, preferred_element_type=preferred_element_type
   )
 
-  res = jax.lax.dot_general(
+  res = _dot_general_with_int_layout_fix(
       lhs_value,
       rhs_value,
       dimension_numbers=dimension_numbers,
@@ -230,7 +296,7 @@ def _fast_dot_general(
     res = qarray.call_with_generic_broadcast(
         jnp.subtract,
         res,
-        jax.lax.dot_general(
+        _dot_general_with_int_layout_fix(
             _broadcast_axes(lhs_zero_point, lhs_value.shape, lhs_ca + lhs_ba),
             rhs_value,
             dimension_numbers=dimension_numbers,
@@ -243,7 +309,7 @@ def _fast_dot_general(
     res = qarray.call_with_generic_broadcast(
         jnp.subtract,
         res,
-        jax.lax.dot_general(
+        _dot_general_with_int_layout_fix(
             lhs_value,
             _broadcast_axes(rhs_zero_point, rhs_value.shape, rhs_ca + rhs_ba),
             dimension_numbers=dimension_numbers,

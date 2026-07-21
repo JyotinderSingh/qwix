@@ -131,6 +131,12 @@ class PrequantizedPtqTest(parameterized.TestCase):
       )
 
   def test_process_prequantized_params_nnx_einsum_sharding(self):
+    if jax.devices()[0].platform != "tpu" or len(jax.devices()) < 4:
+      self.skipTest(
+          "Needs >= 4 devices on a TPU backend for real multi-device"
+          " sharding; GitHub CI runners have 1 CPU device. (On a CPU backend"
+          " params fall back to SingleDeviceSharding even with forced devices.)"
+      )
     mesh = jax.make_mesh(
         (2, 2),
         ("fsdp", "tp"),
@@ -568,6 +574,12 @@ class PrequantizedQtTest(parameterized.TestCase):
     self.assertIsInstance(processed_params["kernel"]["array"], jax.Array)
 
   def test_multi_device_sharding(self):
+    if jax.devices()[0].platform != "tpu" or len(jax.devices()) < 4:
+      self.skipTest(
+          "Needs >= 4 devices on a TPU backend for real multi-device"
+          " sharding; GitHub CI runners have 1 CPU device. (On a CPU backend"
+          " params fall back to SingleDeviceSharding even with forced devices.)"
+      )
     mesh = jax.make_mesh(
         (2, 2),
         ("fsdp", "tp"),
